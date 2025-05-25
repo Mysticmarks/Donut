@@ -1,0 +1,36 @@
+{
+    "model_type": "bagel_v1",
+    "display_name": "BAGEL-7B-MoT (Default)",
+    "description": "The default BAGEL model with Qwen2 LLM and Siglip Vision.",
+    "paths": {
+        "model_weights_root": "BAGELv1", 
+        "llm_config": "llm_config.json",
+        "vit_config": "vit_config.json",
+        "vae_weights": "ae.safetensors",
+        "tokenizer_path": ".", 
+        "checkpoint_file": "ema.safetensors"
+    },
+    "class_references": {
+        "llm_class": "modeling.qwen2.Qwen2ForCausalLM",
+        "vision_class": "modeling.siglip.SiglipVisionModel",
+        "llm_wrapper_class": "model_management.Qwen2Wrapper",
+        "vision_wrapper_class": "model_management.SiglipWrapper",
+        "tokenizer_class": "modeling.qwen2.Qwen2Tokenizer"
+    },
+    "additional_configs": {
+        "bagel_visual_gen": true,
+        "bagel_visual_und": true,
+        "bagel_vit_max_num_patch_per_side": 70,
+        "bagel_connector_act": "gelu_pytorch_tanh",
+        "bagel_latent_patch_size": 2,
+        "bagel_max_latent_size": 64,
+        "llm_qk_norm": true,
+        "llm_tie_word_embeddings": false,
+        "llm_layer_module": "Qwen2MoTDecoderLayer",
+        "vit_rope": false,
+        "vit_num_hidden_layers_reduction": 1,
+        "offload_folder": "offload",
+        "offload_state_dict": true,
+        "force_hooks": true
+    }
+}

@@ -57,10 +57,10 @@ class Bagel(PreTrainedModel):
     config_class = BagelConfig
     base_model_prefix = 'bagel'
 
-    def __init__(self, language_model, vit_model, config: BagelConfig):
+    def __init__(self, language_model, vision_tower, config: BagelConfig): # Changed vit_model to vision_tower
         super().__init__(config)    
-        self.language_model = language_model
-        self.hidden_size = config.llm_config.hidden_size
+        self.language_model = language_model # This will now be an instance of Qwen2Wrapper
+        self.hidden_size = config.llm_config.hidden_size # Accesses original llm_config from BagelConfig
         self.use_moe = "Mo" in config.llm_config.layer_module
         self.num_heads = config.llm_config.num_attention_heads
 
@@ -77,8 +77,8 @@ class Bagel(PreTrainedModel):
             self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.hidden_size)
 
         if config.visual_und:
-            self.vit_model = vit_model
-            self.vit_patch_size = config.vit_config.patch_size
+            self.vision_tower = vision_tower # Changed self.vit_model to self.vision_tower, will be SiglipWrapper
+            self.vit_patch_size = config.vit_config.patch_size # Accesses original vit_config from BagelConfig
             self.vit_max_num_patch_per_side = config.vit_max_num_patch_per_side
             self.vit_hidden_size = config.vit_config.hidden_size
             self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
@@ -147,7 +147,7 @@ class Bagel(PreTrainedModel):
             packed_timesteps: 1-D float tensor, flow timesteps. 0 indicates use clean image.
             mse_loss_indexes: 1-D bool tensor, where to compute mse loss.
         """
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros(size=(sequence_length, self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -166,7 +166,7 @@ class Bagel(PreTrainedModel):
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
-            packed_vit_token_embed = self.vit_model(
+            packed_vit_token_embed = self.vision_tower.process_images(
                 packed_pixel_values=packed_vit_tokens, 
                 packed_flattened_position_ids=packed_vit_position_ids,
                 cu_seqlens=cu_seqlens,
@@ -204,14 +204,38 @@ class Bagel(PreTrainedModel):
                 packed_und_token_indexes=packed_und_token_indexes,
                 packed_gen_token_indexes=packed_vae_token_indexes,
             )
+        
+        # The original Qwen2Model's forward/forward_inference returns a BaseModelOutputWithPast object or similar
+        # which typically has `last_hidden_state` as the first element (index 0).
+        # Or if it returns a tuple, it's (last_hidden_state, past_key_values, hidden_states, attentions)
+        # We need to ensure we get the last_hidden_state correctly.
+        # Assuming forward_inference of the wrapper returns a tuple where the first element is last_hidden_state.
+        # If Qwen2ForCausalLM's forward_inference returns an object, this needs adjustment.
+        # The Qwen2Wrapper's forward_inference returns self.model.forward_inference(...)
+        # Qwen2ForCausalLM.forward_inference returns Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.FloatTensor, torch.FloatTensor]]], Optional[torch.BoolTensor]]
+        # Replacing the LLM call in Bagel.forward with a structured call to self.language_model.forward_inference.
+        # Argument mapping is based on the analysis in previous turns.
+        current_device = packed_sequence.device
+        # packed_query_indexes_for_fwd_inf should ideally represent the indices of all tokens in packed_sequence
+        # that are part of the "query" to the LLM.
+        # If packed_sequence combines text, vit, and vae embeddings, this index needs to cover all of them.
+        # Assuming packed_sequence is fully the query here.
+        packed_query_indexes_for_fwd_inf = torch.arange(0, packed_sequence.size(0), device=current_device, dtype=torch.long)
 
-        last_hidden_state = self.language_model(
-            packed_sequence=packed_sequence,
-            sample_lens=sample_lens,
-            attention_mask=attention_mask,
-            packed_position_ids=packed_position_ids,
-            **extra_inputs,
+        llm_output_tuple = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=sample_lens, # sample_lens from Bagel.forward args
+            packed_query_position_ids=packed_position_ids, # packed_position_ids from Bagel.forward args
+            packed_query_indexes=packed_query_indexes_for_fwd_inf, 
+            past_key_values=None,  # No KV cache during this training forward pass
+            packed_key_value_indexes=None, # No KV cache
+            key_values_lens=sample_lens, # If no KV cache, key_values_lens often matches query_lens
+            update_past_key_values=False, # Not updating KV cache in this forward pass
+            is_causal=True,  # Standard for language modeling
+            attention_mask=attention_mask, # Pass the calculated attention_mask
+            **extra_inputs # Pass any other relevant MoE inputs etc.
         )
+        last_hidden_state = llm_output_tuple[0] # As per Qwen2Wrapper.forward_inference, first element is last_hidden_state.
 
         mse = None
         if self.config.visual_gen:
@@ -222,7 +246,8 @@ class Bagel(PreTrainedModel):
 
         ce = None
         if ce_loss_indexes is not None:
-            packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
+            lm_head = self.language_model.get_lm_head()
+            packed_ce_preds = lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
         return dict(mse=mse, ce=ce)
@@ -273,7 +298,7 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.embed_tokens(packed_text_ids) # Wrapper method
 
         extra_inputs = {}
         if self.use_moe:
@@ -373,14 +398,14 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.embed_tokens(packed_text_ids) # Wrapper method
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
         cu_seqlens = cu_seqlens.to(torch.int32)
         max_seqlen = torch.max(vit_token_seqlens).item()
-        packed_vit_token_embed = self.vit_model(
+        packed_vit_token_embed = self.vision_tower.process_images(
             packed_pixel_values=packed_vit_tokens, 
             packed_flattened_position_ids=packed_vit_position_ids,
             cu_seqlens=cu_seqlens,
@@ -502,7 +527,7 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.embed_tokens(packed_text_ids) # Wrapper method
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -756,7 +781,7 @@ class Bagel(PreTrainedModel):
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.embed_tokens(packed_text_ids) # Wrapper method
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -895,7 +920,7 @@ class Bagel(PreTrainedModel):
         curr_tokens = packed_start_tokens
         while step < max_length:
             generated_sequence.append(curr_tokens)
-            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            packed_text_embedding = self.language_model.embed_tokens(curr_tokens) # Wrapper method
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
                 0, len(key_values_lens), 
@@ -926,7 +951,8 @@ class Bagel(PreTrainedModel):
             )
             past_key_values = output.past_key_values
             packed_query_sequence = output.packed_query_sequence
-            pred_logits = self.language_model.lm_head(packed_query_sequence)
+            lm_head = self.language_model.get_lm_head() # Wrapper method
+            pred_logits = lm_head(packed_query_sequence) 
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
